@@ -9,8 +9,9 @@ from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 from html.parser import HTMLParser
 import re # For basic keyword extraction
+import sys # For sys.stdout.flush()
 
-# --- Thread-Safe Data Structures (provided) ---
+# --- Thread-Safe Data Structures ---
 
 class ThreadSafeVisitedSet:
     """
@@ -66,46 +67,51 @@ class ThreadSafeVisitedSet:
 class ThreadSafeIndexMap:
     """
     A thread-safe inverted index mapping keywords to a list of
-    (relevant_url, origin_url, depth) triples.
+    (relevant_url, origin_url, depth, frequency) tuples.
     This supports "Live Indexing Support" (F.2.2) by allowing the Searcher
     to read while the Indexer actively writes, preventing data corruption
     through "Concurrency and Thread Safety" (5.1).
+
+    The index now stores frequency information for relevancy ranking.
+    Structure: { keyword: { (relevant_url, origin_url, depth): frequency, ... } }
+    This ensures uniqueness per (keyword, url, depth) and stores the highest frequency
+    encountered for that combination.
     """
     def __init__(self):
-        # Structure: { keyword: [(relevant_url, origin_url, depth), ...] }
-        # This structure aligns with the "Searcher (Query Engine)" requirement (F.2.1)
-        # to return a structured list of results formatted as a triple.
+        # Structure: { keyword: { (relevant_url, origin_url, depth): frequency } }
         self._index = {}
         # A single lock is used for simplicity and safety, ensuring atomicity for both
         # read and write operations on the index, as specified in (5.1).
         self._lock = threading.Lock()
 
-    def add(self, keyword: str, relevant_url: str, origin_url: str, depth: int):
+    def add(self, keyword: str, relevant_url: str, origin_url: str, depth: int, frequency: int):
         """
-        Adds a keyword-URL mapping to the index. Keywords are normalized to lowercase
-        for consistent indexing and searching.
+        Adds or updates a keyword-URL mapping with its frequency to the index.
+        Keywords are normalized to lowercase. If an entry for (keyword, url, depth)
+        already exists, its frequency is updated if the new frequency is higher.
         """
-        if not keyword:
-            return # Skip empty keywords
+        if not keyword or frequency <= 0:
+            return # Skip empty keywords or non-positive frequencies
 
         keyword = keyword.lower() # Standardize keyword casing
-
-        # The URL info tuple matches the required search result format (F.2.1).
-        url_info = (relevant_url, origin_url, depth)
+        
+        # The URL key tuple matches the required search result format (F.2.1) prefix.
+        url_key = (relevant_url, origin_url, depth)
 
         with self._lock:
             if keyword not in self._index:
-                self._index[keyword] = []
-            # Prevent duplicate entries for the same URL_info under the same keyword.
-            # This is a simple de-duplication, more advanced would involve sorting
-            # or managing a set of url_info per keyword.
-            if url_info not in self._index[keyword]:
-                self._index[keyword].append(url_info)
+                self._index[keyword] = {}
+            
+            # Store the maximum frequency found for this (keyword, url_key) combination.
+            # This handles cases where a page might be processed multiple times (though
+            # visited_set should prevent this), or if parsing yields different counts.
+            current_freq = self._index[keyword].get(url_key, 0)
+            self._index[keyword][url_key] = max(current_freq, frequency)
 
-    def search(self, query_keyword: str) -> list[tuple[str, str, int]]:
+    def search(self, query_keyword: str) -> list[tuple[str, str, int, int]]:
         """
         Searches the index for the given keyword and returns a list of
-        (relevant_url, origin_url, depth) triples.
+        (relevant_url, origin_url, depth, frequency) tuples.
         Returns an empty list if no matches are found. The results are a copy
         to prevent external modification of the internal index state.
         """
@@ -115,9 +121,14 @@ class ThreadSafeIndexMap:
         query_keyword = query_keyword.lower() # Standardize query keyword casing
 
         with self._lock:
-            # Return a copy of the list to ensure thread safety and prevent
-            # external modifications while the lock is released.
-            return list(self._index.get(query_keyword, []))
+            page_freq_map = self._index.get(query_keyword, {})
+            # Convert the internal dict-of-dicts representation to a list of 4-tuples.
+            # This format is now ready for sorting by frequency.
+            results = [
+                (url, origin, depth, freq)
+                for (url, origin, depth), freq in page_freq_map.items()
+            ]
+            return results
 
     def size(self) -> int:
         """
@@ -128,7 +139,8 @@ class ThreadSafeIndexMap:
 
     def total_entries(self) -> int:
         """
-        Returns the total count of (keyword, url_info) mappings across all keywords.
+        Returns the total count of (keyword, url_info) mappings across all keywords,
+        where each url_info is a unique (relevant_url, origin_url, depth) combination.
         """
         with self._lock:
             return sum(len(v) for v in self._index.values())
@@ -139,7 +151,7 @@ class ThreadSafeIndexMap:
             return f"ThreadSafeIndexMap(keywords={len(self._index)}, entries={self.total_entries()})"
 
 
-# --- Localhost API Structural Design (provided) ---
+# --- Localhost API Structural Design ---
 
 class VibeCrawlerHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     """
@@ -199,19 +211,21 @@ class VibeCrawlerRequestHandler(http.server.BaseHTTPRequestHandler):
             return
 
         # Access the shared index_map from the server instance.
-        results = self.server.index_map.search(query)
+        # This now returns tuples of (relevant_url, origin_url, depth, frequency)
+        results_with_frequency = self.server.index_map.search(query)
 
-        # "Relevancy Ranking" (F.2.3): A baseline heuristic would be applied here.
-        # For this foundational structure, we return the raw matches.
-        # Further development would involve sorting/filtering 'results' based on
-        # keyword frequency, HTML Title tag matching, or other criteria.
+        # "Relevancy Ranking" (F.2.3): Sort results by frequency (descending).
+        # Higher frequency of the keyword on a page implies higher relevancy for that keyword.
+        # The frequency is the 4th element (index 3) in the tuple.
+        sorted_results = sorted(results_with_frequency, key=lambda x: x[3], reverse=True)
 
         formatted_results = []
-        for relevant_url, origin_url, depth in results:
+        for relevant_url, origin_url, depth, frequency in sorted_results:
             formatted_results.append({
                 'relevant_url': relevant_url,
                 'origin_url': origin_url,
-                'depth': depth
+                'depth': depth,
+                'frequency': frequency # Include frequency in the API response
             })
 
         self._set_headers(200)
@@ -239,11 +253,10 @@ class VibeCrawlerRequestHandler(http.server.BaseHTTPRequestHandler):
 
         # Back-pressure/Throttling Status: indicator.
         # This status is managed by the crawler's workload regulation (F.1.3).
-        # It's a system-wide state, represented here as a placeholder.
         metrics['throttling_status'] = 'Active (Crawler respects crawl_delay)'
 
         # Crawler status
-        metrics['crawler_status'] = 'Running' if (self.server.crawler_is_running_event and self.server.crawler_is_running_event.is_set()) else 'Idle/Stopped'
+        metrics['crawler_status'] = 'Running' if (self.server.crawler_is_running_event and self.server.crawler_is_running_event.is_set()) else 'Stopped'
 
         self._set_headers(200)
         self.wfile.write(json.dumps({'dashboard_metrics': metrics}).encode('utf-8'))
@@ -273,7 +286,7 @@ class LinkAndTextExtractor(HTMLParser):
     def handle_endtag(self, tag):
         if tag in ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'div', 'span', 'li', 'td', 'th', 'title']:
             self._recording_text = False
-            # Add a space to separate text blocks
+            # Add a space to separate text blocks for better keyword extraction
             if self.text_content and self.text_content[-1] != ' ':
                 self.text_content.append(' ')
 
@@ -299,7 +312,7 @@ class LinkAndTextExtractor(HTMLParser):
 class Crawler:
     """
     The core recursive crawler logic, managing the frontier, visited URLs, and indexing.
-    Implements backpressure and depth limits.
+    Implements backpressure and depth limits. Workers persist and wait for tasks.
     """
     USER_AGENT = 'VibeCrawler/1.0 (Python native crawler; contact: example@example.com)'
     # Basic list of common stop words for simple keyword filtering
@@ -308,16 +321,23 @@ class Crawler:
         'is', 'it', 'its', 'of', 'on', 'that', 'the', 'to', 'was', 'were', 'will', 'with'
     }
 
+    _POISON_PILL = (None, None, None) # Special tuple to signal workers to stop
+
     def __init__(self, visited_set: ThreadSafeVisitedSet, index_map: ThreadSafeIndexMap,
-                 frontier_queue: queue.Queue, max_depth: int, crawl_delay_seconds: float = 0.5):
+                 frontier_queue: queue.Queue, max_depth: int, crawl_delay_seconds: float = 0.5,
+                 global_crawler_event: threading.Event = None): # Event for dashboard status
         self.visited_set = visited_set
         self.index_map = index_map
         self.frontier_queue = frontier_queue # Stores (url, depth, origin_url) tuples
         self.max_depth = max_depth
         self.crawl_delay_seconds = crawl_delay_seconds
-        self._workers = []
-        self._running = threading.Event() # Event to signal crawler is active/inactive
-        self._active_workers = threading.Semaphore(0) # Track active worker count for graceful shutdown
+        
+        self._workers: list[threading.Thread] = []
+        self._is_workers_running = False # Flag to know if worker threads have been spawned
+        # _stop_event not strictly needed with poison pill but can be used for other internal control
+        self._stop_event = threading.Event() 
+        
+        self.global_crawler_event = global_crawler_event # Event for dashboard/overall system status
 
     def _normalize_url(self, base_url: str, link: str) -> str | None:
         """
@@ -339,20 +359,21 @@ class Crawler:
 
         return clean_url
 
-    def _extract_keywords(self, text: str) -> list[str]:
+    def _extract_keywords(self, text: str) -> dict[str, int]:
         """
-        Extracts simple keywords from text content.
+        Extracts keywords from text content and counts their frequencies.
         Converts to lowercase, splits by non-alphanumeric, filters stop words.
+        Returns a dictionary of {keyword: frequency}.
         """
         # Split by non-alphanumeric characters, convert to lowercase
         words = re.findall(r'\b\w+\b', text.lower())
         
-        # Filter out stop words and single-character words (unless they are numbers)
-        keywords = [
-            word for word in words
-            if word not in self.STOP_WORDS and (len(word) > 1 or word.isdigit())
-        ]
-        return keywords
+        keyword_frequencies = {}
+        for word in words:
+            # Filter out stop words and single-character words (unless they are numbers)
+            if word not in self.STOP_WORDS and (len(word) > 1 or word.isdigit()):
+                keyword_frequencies[word] = keyword_frequencies.get(word, 0) + 1
+        return keyword_frequencies
 
     def _fetch_and_parse(self, url: str) -> tuple[str | None, list[str], str]:
         """
@@ -375,7 +396,7 @@ class Crawler:
                     try:
                         html_content = html_bytes.decode('latin-1')
                     except UnicodeDecodeError:
-                        print(f"Failed to decode HTML for {url}")
+                        # print(f"Failed to decode HTML for {url}")
                         return None, [], ""
                 
                 parser = LinkAndTextExtractor()
@@ -399,13 +420,14 @@ class Crawler:
     def _process_page(self, current_url: str, html_content: str, extracted_links: list[str],
                       page_text: str, depth: int, origin_url: str):
         """
-        Processes the content of a crawled page: adds keywords to index and
+        Processes the content of a crawled page: adds keywords with frequencies to index and
         new URLs to the frontier.
         """
-        # Add keywords to the index
-        keywords = self._extract_keywords(page_text)
-        for keyword in keywords:
-            self.index_map.add(keyword, current_url, origin_url, depth)
+        # Add keywords with their frequencies to the index
+        keyword_frequencies = self._extract_keywords(page_text)
+        for keyword, frequency in keyword_frequencies.items():
+            # Pass the frequency to the index map's add method
+            self.index_map.add(keyword, current_url, origin_url, depth, frequency)
 
         # Add new links to frontier if within depth limit
         if depth < self.max_depth:
@@ -415,18 +437,24 @@ class Crawler:
                     # print(f"  Adding to frontier: {normalized_link} (Depth: {depth + 1})")
                     self.frontier_queue.put((normalized_link, depth + 1, current_url))
 
-    def worker_thread(self):
+    def _worker_thread_loop(self):
         """
         Worker function for crawler threads. Continuously fetches URLs from the frontier
-        and processes them.
+        and processes them. Blocks on the queue until items are available or a stop signal.
         """
-        self._active_workers.release() # Indicate this worker is active
         # print(f"Crawler worker {threading.get_ident()} started.")
 
-        while self._running.is_set():
+        while True:
             try:
-                # Use a timeout to periodically check if the crawler should stop
-                url_info = self.frontier_queue.get(timeout=1)
+                # Blocks indefinitely until an item is available
+                url_info = self.frontier_queue.get() 
+                
+                # Check for poison pill to exit gracefully
+                if url_info == self._POISON_PILL:
+                    # Signal task completion for the poison pill, then exit
+                    self.frontier_queue.task_done()
+                    break 
+
                 current_url, depth, origin_url = url_info
                 
                 # print(f"Worker {threading.get_ident()} crawling: {current_url} (Depth: {depth})")
@@ -437,56 +465,78 @@ class Crawler:
                 
                 self.frontier_queue.task_done()
                 time.sleep(self.crawl_delay_seconds) # Apply backpressure
-            except queue.Empty:
-                # If queue is empty, worker can check if it should shut down or wait
-                if not self._running.is_set():
-                    break # Exit loop if signal to stop is received
-                # Optionally, could sleep longer if queue is empty to reduce busy-waiting
-                time.sleep(self.crawl_delay_seconds * 2)
             except Exception as e:
                 # print(f"Crawler worker error: {e}")
                 self.frontier_queue.task_done() # Mark task as done even if it failed
         
         # print(f"Crawler worker {threading.get_ident()} stopped.")
-        self._active_workers.acquire() # Indicate this worker is no longer active
 
+    def start_workers(self, num_workers: int = 5):
+        """
+        Starts the worker threads if they are not already running.
+        This method should be called once at the start of the application.
+        """
+        if self._is_workers_running:
+            return
 
-    def start(self, seed_urls: list[str], num_workers: int = 5):
-        """
-        Starts the crawling process with initial seed URLs and specified number of workers.
-        """
-        self._running.set() # Set the running flag
         self._workers = []
-
-        # Add initial seed URLs to the frontier
-        for seed_url in seed_urls:
-            normalized_seed = self._normalize_url("", seed_url) # No base URL needed for seed
-            if normalized_seed and self.visited_set.add(normalized_seed):
-                self.frontier_queue.put((normalized_seed, 0, normalized_seed)) # Depth 0, origin is self
-
         for i in range(num_workers):
-            worker = threading.Thread(target=self.worker_thread, daemon=True)
+            worker = threading.Thread(target=self._worker_thread_loop, daemon=True)
             self._workers.append(worker)
             worker.start()
+        self._is_workers_running = True
         
+        if self.global_crawler_event:
+            self.global_crawler_event.set() # Indicate that crawler workers are active
         print(f"Started {num_workers} crawler workers.")
 
-    def stop(self):
+    def add_seeds(self, seed_urls: list[str]):
         """
-        Signals crawler workers to stop and waits for them to finish current tasks.
+        Adds new seed URLs to the frontier queue.
+        Requires workers to be started via `start_workers` beforehand.
         """
-        self._running.clear() # Clear the running flag
-        print("Signaling crawler workers to stop...")
+        if not self._is_workers_running:
+            print("Crawler workers are not running. Please start them first before adding seeds.")
+            return
 
-        # Wait for all workers to release their semaphore
-        for _ in range(len(self._workers)):
-            # acquire with a timeout to prevent infinite block if worker got stuck
-            if not self._active_workers.acquire(timeout=5):
-                print("Warning: A crawler worker might be stuck or slow to shut down.")
+        added_any = False
+        for seed_url in seed_urls:
+            normalized_seed = self._normalize_url("", seed_url) # Base URL not needed for initial seeds
+            if normalized_seed and self.visited_set.add(normalized_seed):
+                print(f"  Adding to frontier: {normalized_seed} (Depth: 0)")
+                self.frontier_queue.put((normalized_seed, 0, normalized_seed))
+                added_any = True
+            elif normalized_seed:
+                print(f"  Skipping already visited or invalid seed: {normalized_seed}")
+            else:
+                print(f"  Skipping invalid seed format: {seed_url}")
         
-        # Optionally wait for the queue to be empty, but workers should handle tasks_done
+        # If new work is added, ensure the global event reflects that workers are 'active'
+        if added_any and self.global_crawler_event and not self.global_crawler_event.is_set():
+            self.global_crawler_event.set()
+
+    def stop_workers(self):
+        """
+        Signals all worker threads to stop gracefully and waits for them to finish.
+        This effectively stops the crawler.
+        """
+        if not self._is_workers_running:
+            return
+
+        print("Signaling crawler workers to stop gracefully...")
+        # Put a poison pill for each worker to make them exit their blocking `get()`
+        for _ in self._workers:
+            self.frontier_queue.put(self._POISON_PILL)
+        
+        # Wait for all currently pending tasks (including poison pills) to be processed.
+        # This will block until all `get()` and `task_done()` pairs have completed.
         self.frontier_queue.join() 
-        print("Crawler workers stopped and queue processed.")
+        
+        if self.global_crawler_event:
+            self.global_crawler_event.clear() # Clear the global event if crawler is stopping
+
+        self._is_workers_running = False
+        print("Crawler workers stopped.")
 
 
 # --- Example Usage and Server Setup ---
@@ -498,25 +548,18 @@ if __name__ == "__main__":
     crawler_running_event = threading.Event() # To signal crawler status to the dashboard
 
     # 2. Crawler Configuration
-    seed_urls = [
-        "https://www.google.com/search?q=python+programming",
-        "https://www.bing.com/search?q=backend+engineering",
-        "https://example.com" # A simpler site for testing
-    ]
     MAX_CRAWL_DEPTH = 2  # Max depth to crawl (0 for seed only, 1 for seed + its links, etc.)
     NUM_CRAWLER_WORKERS = 3
     CRAWL_DELAY = 0.5 # Seconds between requests per worker (backpressure)
 
     crawler = Crawler(visited_urls_set, inverted_index_map,
-                      frontier_queue_instance, MAX_CRAWL_DEPTH, CRAWL_DELAY)
+                      frontier_queue_instance, MAX_CRAWL_DEPTH, CRAWL_DELAY,
+                      global_crawler_event=crawler_running_event)
 
-    # 3. Start the Crawler in a separate thread
-    # The crawler's internal threads manage the crawling. This thread just starts the main orchestrator.
-    crawler_main_thread = threading.Thread(target=crawler.start, args=(seed_urls, NUM_CRAWLER_WORKERS))
-    crawler_main_thread.daemon = True # Allow main program to exit even if crawler_main_thread is running
-    crawler_running_event.set() # Indicate crawler is starting
-    crawler_main_thread.start()
-    print("Crawler started in background.")
+    # 3. Start the persistent Crawler workers in a separate thread
+    # These workers will run in the background, blocking on the queue until tasks appear.
+    crawler.start_workers(NUM_CRAWLER_WORKERS)
+    print("Crawler system initialized and workers are ready.")
 
     # 4. Set up and run the Localhost API Server
     HOST = '127.0.0.1' # Adheres to (5.4) constraint: localhost only.
@@ -525,8 +568,8 @@ if __name__ == "__main__":
     print(f"\n--- Starting VibeCrawler Localhost API Server ---")
     print(f"Server will be accessible at http://{HOST}:{PORT}")
     print(f"Dashboard: http://{HOST}:{PORT}/dashboard")
-    print(f"Search API: http://{HOST}:{PORT}/search?q=web")
-    print("Press Ctrl+C to stop the server.")
+    print(f"Search API Example: http://{HOST}:{PORT}/search?q=python") 
+    print("Type 'help' for commands, 'exit' to stop.")
 
     # Instantiate the custom server with references to the shared data structures.
     server = VibeCrawlerHTTPServer((HOST, PORT), VibeCrawlerRequestHandler,
@@ -539,32 +582,92 @@ if __name__ == "__main__":
     server_thread.daemon = True
     server_thread.start()
 
+    def print_status():
+        print(f"\n--- Live Metrics ---")
+        print(f"Visited URLs: {visited_urls_set.size()}")
+        print(f"Indexed Keywords: {inverted_index_map.size()}")
+        print(f"Indexed Entries: {inverted_index_map.total_entries()}")
+        print(f"Frontier Queue Depth: {frontier_queue_instance.qsize()}")
+        print(f"Crawler Status: {'Running' if crawler_running_event.is_set() else 'Stopped (Workers idle)'}")
+        sys.stdout.flush()
+
+    def print_help():
+        print("\n--- CLI Commands ---")
+        print("  crawl <url>           : Start crawling from the specified URL.")
+        print("  search <query>        : Search the indexed content for keywords.")
+        print("  status                : Display current crawler and index metrics.")
+        print("  help                  : Show this help message.")
+        print("  exit / quit           : Shut down the server and crawler gracefully.")
+        sys.stdout.flush()
+
+    print_help() # Show commands at startup
+
     try:
-        # Keep the main thread alive indefinitely to allow the server_thread and crawler to run.
-        # Use a non-busy wait for efficiency.
+        # 5. Main CLI input loop
         while True:
-            # Periodically print stats to console for live feedback
-            time.sleep(5)
-            print(f"\n--- Live Metrics ---")
-            print(f"Visited URLs: {visited_urls_set.size()}")
-            print(f"Indexed Keywords: {inverted_index_map.size()}")
-            print(f"Indexed Entries: {inverted_index_map.total_entries()}")
-            print(f"Frontier Queue Depth: {frontier_queue_instance.qsize()}")
-            
-            # Check if crawler workers are still active (queue might be empty but workers still running)
-            if frontier_queue_instance.empty() and visited_urls_set.size() > 0:
-                 # Small delay to ensure all `task_done` are called and workers truly idle
-                time.sleep(2) 
-                if frontier_queue_instance.empty():
-                    print("Crawler frontier is empty. Stopping crawler.")
-                    crawler_running_event.clear() # Indicate crawler is stopping/idle
-                    crawler.stop()
-                    break # Exit main loop if crawler is done
+            try:
+                command_line = input("\nVibeCrawler> ").strip()
+                if not command_line:
+                    continue
+
+                parts = command_line.split(' ', 1)
+                command = parts[0].lower()
+                args = parts[1] if len(parts) > 1 else ''
+
+                if command == 'crawl':
+                    if not args:
+                        print("Usage: crawl <url>")
+                        sys.stdout.flush()
+                        continue
+                    # Add new crawl task asynchronously
+                    print(f"Initiating crawl from: {args}")
+                    sys.stdout.flush()
+                    crawler.add_seeds([args]) # Add to the queue, workers will pick it up
+                elif command == 'search':
+                    if not args:
+                        print("Usage: search <query>")
+                        sys.stdout.flush()
+                        continue
+                    print(f"Searching for: '{args}'")
+                    sys.stdout.flush()
+                    results = inverted_index_map.search(args)
+                    if results:
+                        # Results are already sorted by frequency in the _handle_search method for API,
+                        # but we can re-sort here for CLI consistency.
+                        sorted_results = sorted(results, key=lambda x: x[3], reverse=True)
+                        print(f"Found {len(sorted_results)} results:")
+                        for i, (url, origin, depth, freq) in enumerate(sorted_results):
+                            print(f"  {i+1}. URL: {url}")
+                            print(f"     Origin: {origin}, Depth: {depth}, Frequency: {freq}")
+                    else:
+                        print("No results found.")
+                    sys.stdout.flush()
+                elif command == 'status':
+                    print_status()
+                elif command == 'help':
+                    print_help()
+                elif command in ['exit', 'quit']:
+                    print("Exiting VibeCrawler. Shutting down...")
+                    sys.stdout.flush()
+                    break
+                else:
+                    print(f"Unknown command: '{command}'. Type 'help' for available commands.")
+                    sys.stdout.flush()
+            except EOFError: # Handles Ctrl+D
+                print("\nEOF received. Exiting VibeCrawler.")
+                sys.stdout.flush()
+                break
+            except Exception as e:
+                print(f"An unexpected error occurred in CLI: {e}")
+                sys.stdout.flush()
 
     except KeyboardInterrupt:
-        print("\n--- Stopping VibeCrawler Server and Crawler ---")
-        crawler_running_event.clear() # Signal crawler to stop
-        crawler.stop() # Ensure crawler threads are gracefully shut down
+        print("\n--- KeyboardInterrupt: Shutting down VibeCrawler Server and Crawler ---")
+        sys.stdout.flush()
+    finally:
+        # Perform graceful shutdown of both crawler and server
+        crawler.stop_workers() # Ensure crawler threads are gracefully shut down
         server.shutdown() # Shuts down the server, stopping the serve_forever loop.
         server.server_close() # Closes the server socket.
         print("Server and Crawler gracefully stopped.")
+        sys.stdout.flush()

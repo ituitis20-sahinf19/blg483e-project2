@@ -12,6 +12,16 @@ MODEL = 'gemini/gemini-2.5-flash'
 with open('product_prd.md', 'r') as f:
     prd_content = f.read()
 
+current_code = ""
+if os.path.exists('vibe_crawler.py'):
+    with open('vibe_crawler.py', 'r') as f:
+        current_code = f.read()
+
+current_struct = ""
+if os.path.exists('structures.py'):
+    with open('structures.py', 'r') as f:
+        current_struct = f.read()
+
 # 2. Define the Agents based on PRD Section 5.3
 system_architect = Agent(
     role='System Architect',
@@ -51,7 +61,7 @@ devops_specialist = Agent(
 
 # 3. Define the Tasks representing the Interaction Protocol
 
-task_define_structures = Task(
+'''task_define_structures = Task(
     description=(
         f'Using the following PRD as your ONLY source of truth:\n\n{prd_content}\n\n'
         'Generate the foundational thread-safe data structures needed for the crawler and searcher. '
@@ -62,7 +72,7 @@ task_define_structures = Task(
     agent=system_architect,
     output_file='structures.py'
 )
-
+'''
 task_write_logic = Task(
     description=(
         'Using the structures defined in structures.py, implement the recursive crawler, the '
@@ -72,6 +82,37 @@ task_write_logic = Task(
     ),
     expected_output='A Python file with the complete crawler, searcher, and localhost server logic implemented.',
     agent=backend_engineer,
+    output_file='vibe_crawler.py'
+)
+
+
+task_refine_logic = Task(
+    description=(
+        f"Using the current code as a base:\n\n{current_code}\n\n"
+        "Modify the system to match these interactive requirements:\n"
+        "1. PERSISTENCE: The localhost API server must run in a background thread and NEVER terminate "
+        "even after a crawl finishes.\n"
+        "2. CLI COMMANDS: Implement a 'while True' input loop in the main thread. The user should be able to type "
+        "commands like 'crawl <url>', 'search <query>', or 'status'.\n"
+        "3. RELEVANCY: Ensure the 'search' command and the API endpoint return TF-based frequency scores.\n"
+        "4. ASYNC CRAWLING: When a user types 'crawl', it should start the worker pool without freezing the CLI."
+    ),
+    expected_output="An interactive vibe_crawler.py with a persistent CLI shell and background API.",
+    agent=backend_engineer,
+    output_file='vibe_crawler.py'
+)
+
+task_fix_shutdown = Task(
+    description=(
+        "The program hangs during shutdown. Refine vibe_crawler.py and structures.py to:\n"
+        "1. Ensure ALL threads (Crawler workers and API Server) are set as 'daemon=True'.\n"
+        "2. Implement a clean shutdown sequence where 'server.shutdown()' is called followed by "
+        "explicitly clearing the 'frontier_queue' so workers can exit their loops.\n"
+        "3. Use a 'threading.Event' to signal all workers to stop immediately upon 'exit' command."
+    ),
+    expected_output="A version of the system that exits instantly when 'exit' is typed.",
+    agent=backend_engineer,
+    context=[task_write_logic],
     output_file='vibe_crawler.py'
 )
 
@@ -124,7 +165,9 @@ vibe_crew = Crew(
     agents=[system_architect, backend_engineer, qa_auditor, devops_specialist],
     tasks=[
         task_define_structures, 
-        task_write_logic, 
+        task_write_logic,
+        task_refine_logic, 
+        task_fix_shutdown,
         task_qa_review, 
         task_human_review_staging, 
         task_readme_documentation, 
